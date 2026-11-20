@@ -50,6 +50,10 @@ rtspeek --url rtsp://camera.local/stream --pretty=false
 | `--analyze` | `false` | Receive the stream after DESCRIBE and add an `analysis` object to the JSON. **Pulls live video and uses a camera session.** |
 | `--analyze-duration` | `5s` | How long to receive media once the first packet arrives. Maximum `60s`. |
 | `--analyze-transport` | `auto` | `auto` (UDP, falling back to TCP), `udp` or `tcp`. |
+| `--watch` | `false` | Probe repeatedly and emit one timestamped JSON event per line (NDJSON) until interrupted. See [Watch a stream continuously](#watch-a-stream-continuously). |
+| `--watch-interval` | `10s` | Time between successful `--watch` probes. The first probe fires immediately. |
+| `--watch-backoff-initial` | `1s` | First retry delay after a failed probe. |
+| `--watch-backoff-max` | `60s` | Upper bound for the exponential backoff (doubles per failure, ±20% jitter). |
 | `--log-level` | `disabled` | `disabled`, `error`, `warn`, `info`, `debug` or `trace`. Only applies with `--log-console`. |
 | `--log-console` | `false` | Write pretty structured logs to stderr. |
 
@@ -183,6 +187,49 @@ rtspeek --url rtsp://camera.local/stream --analyze --analyze-duration 15s --anal
 
 `findings` is always an array, sorted by severity. Findings never change the exit code; read them in the output. A failed analysis does not fail the describe: `describe_ok` stays as DESCRIBE left it, and `analysis.error` says what went wrong.
 
+## Watch a stream continuously
+
+A single probe cannot show *when* a night-time dropout starts or how long it lasts. `--watch` keeps probing on a schedule and writes one JSON object per event to stdout, one per line ([NDJSON](https://en.wikipedia.org/wiki/JSON_streaming#Line-delimited_JSON)), each with a UTC `time` stamp. Without `--analyze` every probe is a DESCRIBE; with `--analyze` every probe is a short receive window whose metrics are attached to the `probe_ok` event.
+
+```bash
+rtspeek --url rtsp://camera.local/stream --watch --watch-interval 30s
+rtspeek --url rtsp://user:pass@camera.local/stream --watch --analyze \
+  --analyze-duration 5s --analyze-transport udp
+```
+
+```jsonl
+{"time":"2026-11-20T03:56:15.721207409Z","type":"state_up","state":"up","message":"stream is reachable","consecutive_failures":0}
+{"time":"2026-11-20T03:56:15.721377263Z","type":"probe_ok","state":"up","consecutive_failures":0,"metrics":{"latency_ms":2.28,"media_count":1,"window_ms":250.07,"packets":25,"max_jitter_ms":23.46,"bitrate_kbps":11.2,"transport":"tcp"}}
+{"time":"2026-11-20T03:57:02.100344112Z","type":"state_down","state":"down","reason":"timeout","message":"operation timed out after 5s","consecutive_failures":1}
+{"time":"2026-11-20T03:57:02.100512908Z","type":"probe_failed","state":"down","reason":"timeout","message":"operation timed out after 5s","consecutive_failures":1}
+{"time":"2026-11-20T03:57:02.100566880Z","type":"backoff","state":"down","message":"waiting 920ms before retry","consecutive_failures":1,"backoff_ms":920}
+{"time":"2026-11-20T03:58:11.440221881Z","type":"state_up","state":"up","message":"stream is reachable","consecutive_failures":0}
+{"time":"2026-11-20T03:58:11.440401993Z","type":"probe_ok","state":"up","consecutive_failures":0,"metrics":{"latency_ms":3.01,"media_count":1}}
+{"time":"2026-11-20T03:59:00.002211440Z","type":"cancelled","state":"up","consecutive_failures":0,"message":"watch cancelled: context canceled"}
+```
+
+### Event types
+
+| `type` | When it fires |
+|--------|---------------|
+| `state_up` | The first successful probe, or recovery after failures. |
+| `state_down` | The first failure after the stream was up; carries `reason` and optional `status_code`. |
+| `probe_ok` | Every successful probe, with the `metrics` window (latency; plus packets, loss, jitter, bitrate and transport in analyze mode). |
+| `probe_failed` | Every failed probe; `consecutive_failures` counts the current streak and `reason` is the machine-readable failure code (`timeout`, `connection_refused`, `auth_required`, `connection_closed`, `analysis_failed`, …). |
+| `backoff` | A failed probe scheduled a retry; `backoff_ms` is the actual delay including jitter. |
+| `redirect` | The server answered 3xx with a `Location` header (`redirect_location`, redacted). The client follows it inside the same probe, so the probe may still return `probe_ok`. |
+| `empty_window` | An analyze window received zero RTP packets on every track. |
+| `jitter` | An analyze window measured jitter at or above the warning threshold (`metrics.max_jitter_ms`). |
+| `cancelled` | The process was interrupted (Ctrl-C / SIGTERM); always the last event. |
+
+### Reconnect semantics
+
+- **Credentials and transport persist.** The URL (including its userinfo) and the `--analyze-transport` choice are reused verbatim for every reconnect.
+- **Fresh RTP sequence space.** Every probe builds a brand-new RTSP client (OPTIONS → DESCRIBE → SETUP → PLAY), so after recovery the new session starts its own RTP sequence numbers. The client never compares the new stream's sequence against the dead session's, which would otherwise report a phantom multi-million-packet loss.
+- **Exponential backoff with a ceiling.** After a failure the delay is `--watch-backoff-initial` doubled per consecutive failure, capped at `--watch-backoff-max` and randomized ±20% so a fleet does not retry in lockstep. Success resets both the counter and the delay.
+- The single-probe behavior and JSON schema are unchanged when `--watch` is not passed.
+- With `--fail`, watch mode exits `1` on the first failed probe instead of waiting for an interrupt.
+
 | Code | Severity | When |
 |------|----------|------|
 | `packet_loss` | warn at 0.5%, error at 2% | RTP packets missing from the sequence |
@@ -264,6 +311,36 @@ func main() {
 ```
 
 A complete example with `HasVideo`, `GetFirstVideoMedia` and the free-function helpers is in [`examples/video_media_example.go`](examples/video_media_example.go). Run it with `go run ./examples`.
+
+### Watch continuously
+
+`Watch` runs the same probe in a loop and delivers timestamped `WatchEvent` values to a callback. It blocks until the context is cancelled, and the final event is always `EventCancelled`. Each probe opens a fresh RTSP client, so a recovered session does not inherit the old RTP sequence numbers; credentials (from the URL) and the transport (from `AnalyzeOptions`) are reused across reconnects.
+
+```go
+ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+defer stop()
+
+opts := rtspeek.WatchOptions{
+    Timeout:        5 * time.Second,
+    Interval:       30 * time.Second,
+    BackoffInitial: time.Second,
+    BackoffMax:     60 * time.Second,
+    Analyze: &rtspeek.AnalyzeOptions{ // optional: short receive windows
+        Duration:  5 * time.Second,
+        Transport: rtspeek.TransportUDP,
+    },
+}
+err := rtspeek.Watch(ctx, "rtsp://user:pass@host/stream", opts, func(ev rtspeek.WatchEvent) {
+    switch ev.Type {
+    case rtspeek.EventStateDown:
+        log.Printf("stream DOWN: %s (%s)", ev.Reason, ev.Message)
+    case rtspeek.EventStateUp:
+        log.Printf("stream UP after %d failures", ev.ConsecutiveFailures)
+    case rtspeek.EventProbeOK:
+        log.Printf("probe ok: %+v", ev.Metrics)
+    }
+})
+```
 
 ### StreamInfo
 

@@ -204,6 +204,58 @@ It exits 1 if a check fails. Afterwards `ss -lnt | grep 9554` shows nothing.
 T5b needs no extra server: use the impairment proxy with `-loss 1` against the
 normal test server.
 
+## 4b. Continuous watch (`--watch`)
+
+`--watch` is covered by fake-server unit tests in `pkg/rtspeek` (outage,
+recovery, timeout, 401, 302, empty window, jitter, cancellation, backoff cap,
+fresh RTP sequence numbers). This section is the live-server layer.
+
+### W1. Flap detection and event order
+
+1. Start mediamtx and the ffmpeg publisher from section 1.
+2. Run, redirecting to a file:
+   ```bash
+   $RTSPEEK --url rtsp://127.0.0.1:8554/test --watch --watch-interval 2s \
+     --watch-backoff-initial 500ms --watch-backoff-max 4s --pretty=false \
+     > /tmp/watch.jsonl
+   ```
+3. After two `probe_ok` lines, stop mediamtx (Ctrl-C), wait ~5s, start it again.
+4. Ctrl-C rtspeek once `state_up` reappears.
+
+Expected sequence in `/tmp/watch.jsonl`:
+`state_up` → `probe_ok`+ → `state_down` (reason `connection_refused` or
+`connection_closed`) → `probe_failed`+ with a monotonically increasing
+`consecutive_failures` → `backoff` lines whose `backoff_ms` doubles until it
+saturates near 4000 → `state_up` with `consecutive_failures:0` → `probe_ok` →
+`cancelled` last. Every object has a `time` stamp and parses with
+`jq -e . /tmp/watch.jsonl >/dev/null`.
+
+### W2. Analyze windows survive a reconnect with a fresh sequence space
+
+```bash
+$RTSPEEK --url rtsp://127.0.0.1:8554/test --watch --analyze \
+  --analyze-duration 2s --analyze-transport tcp --watch-interval 1s \
+  --pretty=false
+```
+
+Restart mediamtx once while it runs. Every `probe_ok` after recovery must show
+`metrics.lost: 0` and `metrics.loss_percent: 0` (the new camera session starts
+its own RTP sequence numbers; a phantom six- or seven-figure loss means the
+client wrongly reused the old session's receiver state).
+
+### W3. UDP loss and jitter through the impairment proxy
+
+Run the proxy from section 4 with e.g. `-loss 0.2 -delay-min 5ms -delay-max
+40ms`, then watch `rtsp://127.0.0.1:8555/test` with `--analyze
+--analyze-transport udp`. Expect non-zero `metrics.loss_percent` on `probe_ok`
+events and periodic `jitter` events; `state` stays `up`.
+
+### W4. Credentials and redaction
+
+Point watch at an authenticated path (mediamtx `authInternalUsers`). The URL's
+userinfo works on every reconnect without re-prompting, and
+`grep -E 'password|SECRET' /tmp/watch.jsonl` finds nothing.
+
 ## 5. Known limits
 
 - Frame analysis covers H.264 and H.265 only.

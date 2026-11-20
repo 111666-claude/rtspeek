@@ -7,8 +7,10 @@ import (
 	"io"
 	neturl "net/url"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strings"
+	"syscall"
 	"time"
 
 	rtpeek "github.com/0x524A/rtspeek/pkg/rtspeek"
@@ -71,6 +73,10 @@ func newApp() *cli.App {
 			&cli.BoolFlag{Name: "analyze", Usage: "Receive the stream and report packet loss, jitter and bitrate (pulls live video and uses a camera session)"},
 			&cli.DurationFlag{Name: "analyze-duration", Usage: "How long to receive media with --analyze (max 60s)", Value: rtpeek.DefaultAnalyzeDuration},
 			&cli.StringFlag{Name: "analyze-transport", Usage: "Transport for --analyze: auto, udp or tcp", Value: "auto"},
+			&cli.BoolFlag{Name: "watch", Usage: "Probe repeatedly and emit one timestamped JSON event per line (NDJSON) until interrupted; combine with --analyze for short receive windows"},
+			&cli.DurationFlag{Name: "watch-interval", Usage: "Interval between successful --watch probes", Value: rtpeek.DefaultWatchInterval},
+			&cli.DurationFlag{Name: "watch-backoff-initial", Usage: "First retry delay after a failed --watch probe", Value: rtpeek.DefaultWatchBackoffInitial},
+			&cli.DurationFlag{Name: "watch-backoff-max", Usage: "Upper bound for the exponential retry backoff in --watch mode", Value: rtpeek.DefaultWatchBackoffMax},
 			&cli.BoolFlag{Name: "fail", Usage: "Exit 1 when OPTIONS or DESCRIBE fails (the JSON is still printed)"},
 			&cli.StringFlag{Name: "user", Usage: "Username, when the URL has none", EnvVars: []string{"RTSPEEK_USER"}},
 			&cli.StringFlag{Name: "password-file", Usage: "Read the password from this file, or from stdin if \"-\" (else $RTSPEEK_PASSWORD)"},
@@ -101,8 +107,22 @@ func newApp() *cli.App {
 				}
 			}
 
-			// Setup context - support both new logging and legacy debug
-			ctx := context.Background()
+			// Setup context - support both new logging and legacy debug.
+			// signalCtx outlives the WithDebug/WithLogger reassignments
+			// below, so the signal goroutine never races with them.
+			signalCtx, stopSignals := context.WithCancel(context.Background())
+			defer stopSignals()
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+			go func() {
+				select {
+				case <-sigCh:
+					stopSignals()
+				case <-signalCtx.Done():
+				}
+			}()
+			defer signal.Stop(sigCh)
+			ctx := context.Context(signalCtx)
 			if debug || (logger != nil) {
 				ctx = rtpeek.WithDebug(ctx)
 			}
@@ -122,6 +142,24 @@ func newApp() *cli.App {
 				}
 			}
 			fail := c.Bool("fail")
+			if c.Bool("watch") {
+				wopts := rtpeek.WatchOptions{
+					Timeout:        timeout,
+					Interval:       c.Duration("watch-interval"),
+					BackoffInitial: c.Duration("watch-backoff-initial"),
+					BackoffMax:     c.Duration("watch-backoff-max"),
+				}
+				if c.Bool("analyze") {
+					wopts.Analyze = &rtpeek.AnalyzeOptions{
+						Duration:  c.Duration("analyze-duration"),
+						Transport: rtpeek.AnalyzeTransport(c.String("analyze-transport")),
+					}
+				}
+				if err := wopts.Validate(); err != nil {
+					return err
+				}
+				return runWatch(ctx, url, wopts, os.Stdout, fail)
+			}
 			info, err := rtpeek.DescribeStreamWithOptions(ctx, url, opts)
 			if err != nil {
 				// Print verbose error information to stderr if requested

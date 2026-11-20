@@ -19,6 +19,12 @@ type RTSPSession struct {
 
 	// switchedTransport is set when gortsplib falls back from UDP to TCP.
 	switchedTransport atomic.Bool
+
+	// onResponse, when set, is invoked for every RTSP response the client
+	// receives, including redirects that gortsplib follows internally. It is
+	// package-internal wiring used by Watch; the exported session API is
+	// unchanged.
+	onResponse func(*base.Response)
 }
 
 // NewRTSPSession creates a new RTSP session with the specified timeout and logger.
@@ -28,7 +34,11 @@ func NewRTSPSession(timeout time.Duration, logger *Logger) *RTSPSession {
 		WriteTimeout: timeout,
 	}
 
-	// Set up logging callbacks if logger is provided and debug level is enabled
+	// Set up logging callbacks if logger is provided and debug level is enabled.
+	// The response hook is installed even without a logger so Watch can observe
+	// redirects (gortsplib follows 3xx internally and never surfaces them as
+	// errors).
+	hookInstalled := false
 	if logger != nil && logger.level >= LogLevelDebug {
 		client.OnRequest = func(req *base.Request) {
 			headers := make(map[string][]string)
@@ -45,6 +55,7 @@ func NewRTSPSession(timeout time.Duration, logger *Logger) *RTSPSession {
 			}
 			logger.RTSPResponse(int(res.StatusCode), res.StatusMessage, headers)
 		}
+		hookInstalled = true
 	}
 
 	// gortsplib prints to stderr when these are nil, so always install them.
@@ -63,6 +74,21 @@ func NewRTSPSession(timeout time.Duration, logger *Logger) *RTSPSession {
 		rs.switchedTransport.Store(true)
 		if logger != nil {
 			logger.Debug("transport switch", map[string]interface{}{"reason": err.Error()})
+		}
+	}
+	if !hookInstalled {
+		client.OnResponse = func(res *base.Response) {
+			if rs.onResponse != nil {
+				rs.onResponse(res)
+			}
+		}
+	} else {
+		logged := client.OnResponse
+		client.OnResponse = func(res *base.Response) {
+			logged(res)
+			if rs.onResponse != nil {
+				rs.onResponse(res)
+			}
 		}
 	}
 

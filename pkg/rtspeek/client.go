@@ -73,6 +73,9 @@ func DescribeStreamWithOptions(ctx context.Context, url string, opts Options) (S
 
 	// Perform RTSP operations with timeout handling
 	session := NewRTSPSession(timeout, logger)
+	if hook, ok := ctx.Value(responseHookKey).(func(*base.Response)); ok && hook != nil {
+		session.onResponse = hook
+	}
 	// The goroutine below owns the client and closes it. Closing from here
 	// could race with a describe that is still starting up after a timeout.
 	// With analysis the client stays open until this function returns.
